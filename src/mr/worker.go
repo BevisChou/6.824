@@ -1,10 +1,25 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+)
 
+type TaskInfo ReportReply
+
+type Status struct {
+	IsIdle bool
+	Mu     sync.Mutex
+}
 
 //
 // Map functions return a slice of KeyValue.
@@ -12,6 +27,26 @@ import "hash/fnv"
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func (status *Status) GetStatus() bool {
+	status.Mu.Lock()
+	defer status.Mu.Unlock()
+	return status.IsIdle
+}
+
+func (status *Status) SetStatus(isIdle bool) {
+	status.Mu.Lock()
+	defer status.Mu.Unlock()
+	status.IsIdle = isIdle
 }
 
 //
@@ -24,7 +59,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,38 +66,138 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	status := Status{IsIdle: true}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	id := DoCheckin()
+	taskChan := make(chan TaskInfo)
 
+	go DoReport(id, &taskChan, &status)
+
+	prefix := "intermediate-"
+
+	for {
+		taskInfo := <-taskChan
+		status.SetStatus(false)
+		if taskInfo.TaskIdentifier.JobId%2 == 0 {
+			DoMap(mapf, taskInfo.FileName, prefix, taskInfo.TaskIdentifier.TaskId, taskInfo.Num)
+		} else {
+			DoReduce(reducef, prefix, taskInfo.Num, taskInfo.TaskIdentifier.TaskId, taskInfo.FileName)
+		}
+		status.SetStatus(true)
+	}
+}
+
+func DoMap(mapf func(string, string) []KeyValue, fileName string, prefix string, taskId int, nReduce int) {
+	inputFile, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", inputFile)
+	}
+	defer inputFile.Close()
+	content, err := ioutil.ReadAll(inputFile)
+	if err != nil {
+		log.Fatalf("cannot read %v", inputFile)
+	}
+
+	pairs := mapf(fileName, string(content))
+
+	buckets := make([][]KeyValue, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		buckets = append(buckets, make([]KeyValue, 0))
+	}
+	for _, pair := range pairs {
+		i := ihash(pair.Key) % nReduce
+		buckets[i] = append(buckets[i], pair)
+	}
+
+	prefix = prefix + strconv.Itoa(taskId) + "-"
+	for i := 0; i < nReduce; i++ {
+		outputFile, _ := ioutil.TempFile("", "")
+		enc := json.NewEncoder(outputFile)
+		for _, kv := range buckets[i] {
+			if err := enc.Encode(&kv); err != nil {
+				log.Fatalf("cannot write %v", outputFile.Name())
+			}
+		}
+		outputFile.Close()
+		if err := os.Rename(outputFile.Name(), prefix+strconv.Itoa(i)); err != nil {
+			log.Fatalf("cannot rename %v", outputFile.Name())
+		}
+	}
+}
+
+func DoReduce(reducef func(string, []string) string, prefix string, nMap int, taskId int, fileName string) {
+	pairs := make([]KeyValue, 0)
+
+	for i := 0; i < nMap; i++ {
+		inputFile, err := os.Open(prefix + strconv.Itoa(i) + "-" + strconv.Itoa(taskId))
+		if err != nil {
+			log.Fatalf("cannot open %v", inputFile.Name())
+		}
+		dec := json.NewDecoder(inputFile)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			pairs = append(pairs, kv)
+		}
+		inputFile.Close()
+	}
+
+	sort.Sort(ByKey(pairs))
+
+	outputFile, _ := os.Create(fileName)
+
+	i := 0
+	for i < len(pairs) {
+		j := i + 1
+		for j < len(pairs) && pairs[j].Key == pairs[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, pairs[k].Value)
+		}
+		res := reducef(pairs[i].Key, values)
+
+		fmt.Fprintf(outputFile, "%v %v\n", pairs[i].Key, res)
+
+		i = j
+	}
+
+	outputFile.Close()
 }
 
 //
-// example function to show how to make an RPC call to the coordinator.
-//
 // the RPC argument and reply types are defined in rpc.go.
 //
-func CallExample() {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+func DoCheckin() int {
+	args := CheckinArgs{}
+	args.Timestamp = time.Now()
+	reply := CheckinReply{}
 
-	// fill in the argument(s).
-	args.X = 99
+	ok := call("Coordinator.Checkin", &args, &reply)
 
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
+	id := -1
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		id = reply.Id
+	}
+	return id
+}
+
+func DoReport(id int, taskChan *chan TaskInfo, status *Status) {
+	for {
+		args := ReportArgs{Timestamp: time.Now()}
+		args.IsIdle = status.GetStatus()
+		reply := ReportReply{}
+
+		ok := call("Coordinator.Report", &args, &reply)
+		if ok && reply.TaskIdentifier != NO_TASK() {
+			*taskChan <- TaskInfo(reply) // would not block
+		}
+
+		time.Sleep(time.Second) // report every second
 	}
 }
 
