@@ -14,13 +14,6 @@ import (
 	"time"
 )
 
-type TaskInfo ReportReply
-
-type Status struct {
-	IsIdle bool
-	Mu     sync.Mutex
-}
-
 //
 // Map functions return a slice of KeyValue.
 //
@@ -36,6 +29,13 @@ type ByKey []KeyValue
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+type TaskInfo ReportReply
+
+type Status struct {
+	IsIdle bool
+	Mu     sync.Mutex
+}
 
 func (status *Status) GetStatus() bool {
 	status.Mu.Lock()
@@ -90,12 +90,12 @@ func Worker(mapf func(string, string) []KeyValue,
 func DoMap(mapf func(string, string) []KeyValue, fileName string, prefix string, taskId int, nReduce int) {
 	inputFile, err := os.Open(fileName)
 	if err != nil {
-		log.Fatalf("cannot open %v", inputFile)
+		log.Fatalf("cannot open %v", fileName)
 	}
 	defer inputFile.Close()
 	content, err := ioutil.ReadAll(inputFile)
 	if err != nil {
-		log.Fatalf("cannot read %v", inputFile)
+		log.Fatalf("cannot read %v", inputFile.Name())
 	}
 
 	pairs := mapf(fileName, string(content))
@@ -129,9 +129,10 @@ func DoReduce(reducef func(string, []string) string, prefix string, nMap int, ta
 	pairs := make([]KeyValue, 0)
 
 	for i := 0; i < nMap; i++ {
-		inputFile, err := os.Open(prefix + strconv.Itoa(i) + "-" + strconv.Itoa(taskId))
+		infile := prefix + strconv.Itoa(i) + "-" + strconv.Itoa(taskId)
+		inputFile, err := os.Open(infile)
 		if err != nil {
-			log.Fatalf("cannot open %v", inputFile.Name())
+			log.Fatalf("cannot open %v", infile)
 		}
 		dec := json.NewDecoder(inputFile)
 		for {
@@ -146,7 +147,7 @@ func DoReduce(reducef func(string, []string) string, prefix string, nMap int, ta
 
 	sort.Sort(ByKey(pairs))
 
-	outputFile, _ := os.Create(fileName)
+	outputFile, _ := ioutil.TempFile("", "")
 
 	i := 0
 	for i < len(pairs) {
@@ -166,6 +167,9 @@ func DoReduce(reducef func(string, []string) string, prefix string, nMap int, ta
 	}
 
 	outputFile.Close()
+	if err := os.Rename(outputFile.Name(), fileName); err != nil {
+		log.Fatalf("cannot rename %v", outputFile.Name())
+	}
 }
 
 //
@@ -188,8 +192,7 @@ func DoCheckin() int {
 
 func DoReport(id int, taskChan *chan TaskInfo, status *Status) {
 	for {
-		args := ReportArgs{Timestamp: time.Now()}
-		args.IsIdle = status.GetStatus()
+		args := ReportArgs{time.Now(), id, status.GetStatus()}
 		reply := ReportReply{}
 
 		ok := call("Coordinator.Report", &args, &reply)

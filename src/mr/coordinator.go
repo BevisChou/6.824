@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-type WorkerRecord struct {
-	LastReportedTime time.Time
-	TaskAssigned     TaskIdentifier
+type Coordinator struct {
+	WorkerList WorkerList
+	Schedule   Schedule
 }
 
 type WorkerList struct {
@@ -21,9 +21,9 @@ type WorkerList struct {
 	Mu            sync.Mutex
 }
 
-type Coordinator struct {
-	WorkerList WorkerList
-	Schedule   Schedule
+type WorkerRecord struct {
+	LastReportedTime time.Time
+	TaskAssigned     TaskIdentifier
 }
 
 type TaskIdentifier struct {
@@ -72,41 +72,14 @@ func (workerList *WorkerList) Supervise(taskQueue *chan TaskIdentifier) {
 	}
 }
 
-// Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) Checkin(args *CheckinArgs, reply *CheckinReply) error {
-	reply.Id = c.WorkerList.AddWorker(args.Timestamp)
-	return nil
-}
-
-func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
-	c.WorkerList.Mu.Lock()
-	defer c.WorkerList.Mu.Unlock()
-
-	record := &c.WorkerList.WorkerRecords[args.WorkerId]
-
-	if args.Timestamp.After(record.LastReportedTime) {
-		record.LastReportedTime = args.Timestamp
-		if args.IsIdle {
-			updated := c.Schedule.Update(record.TaskAssigned)
-			if updated {
-				for i := range c.WorkerList.WorkerRecords {
-					c.WorkerList.WorkerRecords[i].TaskAssigned = NO_TASK()
-				}
-			}
-
-			reply.TaskIdentifier = NO_TASK()
-			select {
-			case task := <-c.Schedule.TaskQueue:
-				// task might be stale
-				fileName, num, ok := c.Schedule.GetTaskInfo(task)
-				if ok {
-					reply.TaskIdentifier, reply.FileName, reply.Num = task, fileName, num
-				}
-			default:
-			}
-		}
+func MakeSchedule(inputFiles []string, outputFiles []string) *Schedule {
+	ret := Schedule{Jobs: make([]*Job, 0, 2), CurrentJobId: 0, TaskQueue: make(chan TaskIdentifier, 1000)}
+	ret.Jobs = append(ret.Jobs, MakeJob(inputFiles, len(outputFiles)))
+	ret.Jobs = append(ret.Jobs, MakeJob(outputFiles, len(inputFiles)))
+	for i := range ret.Jobs[0].Tasks {
+		ret.TaskQueue <- TaskIdentifier{0, i}
 	}
-	return nil
+	return &ret
 }
 
 func (schedule *Schedule) GetTaskInfo(task TaskIdentifier) (string, int, bool) {
@@ -124,15 +97,15 @@ func (schedule *Schedule) GetTaskInfo(task TaskIdentifier) (string, int, bool) {
 	return fileName, job.Num, ok
 }
 
-func (s *Schedule) Update(taskIdentifier TaskIdentifier) bool {
+func (schedule *Schedule) Update(taskIdentifier TaskIdentifier) bool {
 	ret := false
 
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
+	schedule.Mu.Lock()
+	defer schedule.Mu.Unlock()
 
-	if taskIdentifier != NO_TASK() && taskIdentifier.JobId == s.CurrentJobId {
+	if taskIdentifier != NO_TASK() && taskIdentifier.JobId == schedule.CurrentJobId {
 		// situation where the work has done a duplicate job is handled
-		job := s.Jobs[s.CurrentJobId]
+		job := schedule.Jobs[schedule.CurrentJobId]
 		job.Mu.Lock()
 		defer job.Mu.Unlock()
 
@@ -141,10 +114,10 @@ func (s *Schedule) Update(taskIdentifier TaskIdentifier) bool {
 			// task not done by others
 			delete(job.Tasks, taskIdentifier.TaskId)
 			if len(job.Tasks) == 0 {
-				s.CurrentJobId++
-				if s.CurrentJobId < len(s.Jobs) {
-					for i := range s.Jobs[s.CurrentJobId].Tasks {
-						s.TaskQueue <- TaskIdentifier{s.CurrentJobId, i}
+				schedule.CurrentJobId++
+				if schedule.CurrentJobId < len(schedule.Jobs) {
+					for i := range schedule.Jobs[schedule.CurrentJobId].Tasks {
+						schedule.TaskQueue <- TaskIdentifier{schedule.CurrentJobId, i}
 					}
 				}
 				ret = true
@@ -152,6 +125,53 @@ func (s *Schedule) Update(taskIdentifier TaskIdentifier) bool {
 		}
 	}
 	return ret
+}
+
+func MakeJob(fileNames []string, num int) *Job {
+	ret := Job{Tasks: make(map[int]string), Num: num}
+	for i, fileName := range fileNames {
+		ret.Tasks[i] = fileName
+	}
+	return &ret
+}
+
+// Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) Checkin(args *CheckinArgs, reply *CheckinReply) error {
+	reply.Id = c.WorkerList.AddWorker(args.Timestamp)
+	return nil
+}
+
+func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
+	reply.TaskIdentifier = NO_TASK()
+
+	c.WorkerList.Mu.Lock()
+	defer c.WorkerList.Mu.Unlock()
+
+	record := &c.WorkerList.WorkerRecords[args.WorkerId]
+
+	if args.Timestamp.After(record.LastReportedTime) {
+		record.LastReportedTime = args.Timestamp
+		if args.IsIdle {
+			updated := c.Schedule.Update(record.TaskAssigned)
+			if updated {
+				for i := range c.WorkerList.WorkerRecords {
+					c.WorkerList.WorkerRecords[i].TaskAssigned = NO_TASK()
+				}
+			}
+			record.TaskAssigned = NO_TASK()
+			select {
+			case task := <-c.Schedule.TaskQueue:
+				// task might be stale
+				fileName, num, ok := c.Schedule.GetTaskInfo(task)
+				if ok {
+					record.TaskAssigned = task
+					reply.TaskIdentifier, reply.FileName, reply.Num = task, fileName, num
+				}
+			default:
+			}
+		}
+	}
+	return nil
 }
 
 //
@@ -178,24 +198,6 @@ func (c *Coordinator) Done() bool {
 	c.Schedule.Mu.Lock()
 	defer c.Schedule.Mu.Unlock()
 	return c.Schedule.CurrentJobId == len(c.Schedule.Jobs)
-}
-
-func MakeSchedule(inputFiles []string, outputFiles []string) *Schedule {
-	ret := Schedule{Jobs: make([]*Job, 0, 2), CurrentJobId: 0, TaskQueue: make(chan TaskIdentifier)}
-	ret.Jobs = append(ret.Jobs, MakeJob(inputFiles, len(outputFiles)))
-	ret.Jobs = append(ret.Jobs, MakeJob(outputFiles, len(inputFiles)))
-	for i := range ret.Jobs[0].Tasks {
-		ret.TaskQueue <- TaskIdentifier{0, i}
-	}
-	return &ret
-}
-
-func MakeJob(fileNames []string, num int) *Job {
-	ret := Job{Tasks: make(map[int]string), Num: num}
-	for i, fileName := range fileNames {
-		ret.Tasks[i] = fileName
-	}
-	return &ret
 }
 
 //
