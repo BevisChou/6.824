@@ -19,7 +19,7 @@ package raft
 
 import (
 	//	"bytes"
-
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -30,11 +30,16 @@ import (
 )
 
 type Identity int32
+type ElectionResult int
 
 const (
 	FOLLOWER  Identity = 0
 	CANDIDATE Identity = 1
 	LEADER    Identity = 2
+
+	WON   ElectionResult = 0
+	LOST  ElectionResult = 1
+	SPLIT ElectionResult = 2
 
 	NOBODY int = -1
 )
@@ -151,6 +156,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func (rf *Raft) updateTerm(term int, leader int) {
+	rf.currentLeader = leader
+	rf.currentTerm = term
+	rf.votedFor = NOBODY
+	rf.setIdentity(FOLLOWER)
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -169,10 +181,6 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Voted bool
 	Term  int
-
-	// addition info for retry after timeout
-	Replied bool
-	Server  int
 }
 
 func (rf *Raft) voteFor(args *RequestVoteArgs) bool {
@@ -180,7 +188,7 @@ func (rf *Raft) voteFor(args *RequestVoteArgs) bool {
 		return false
 	} else {
 		// for 2A we blindly vote for whoever sends the request first
-		return rf.votedFor == NOBODY || rf.me == args.Me
+		return rf.votedFor == NOBODY
 	}
 }
 
@@ -189,15 +197,21 @@ func (rf *Raft) voteFor(args *RequestVoteArgs) bool {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = NOBODY
+		log.Printf("%v set term to %v in RequestVote and become follower\n", rf.me, args.Term)
+		rf.updateTerm(args.Term, NOBODY)
 	}
 	if rf.voteFor(args) {
-		reply.Voted = true
+		log.Printf("%v current votedFor: %v at term %v\n", rf.me, rf.votedFor, rf.currentTerm)
 		rf.votedFor = args.Me
+		reply.Voted = true
+	} else {
+		reply.Voted = false
 	}
 	reply.Term = rf.currentTerm
+	log.Printf("%v(term: %v) response to %v(term: %v): %v\n", rf.me, rf.currentTerm, args.Me, args.Term, reply.Voted)
 }
 
 //
@@ -232,8 +246,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, ch *chan *RequestVoteReply) {
 	reply := &RequestVoteReply{}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	reply.Replied, reply.Server = ok, server
-	*ch <- reply
+	if ok {
+		*ch <- reply
+	}
 }
 
 //
@@ -253,16 +268,25 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// log.Printf("%v received heartbeat from %v\n", rf.me, args.Leader)
 	if rf.currentTerm > args.Term {
 		reply.Term, reply.Leader = rf.currentTerm, rf.currentLeader
 		return
 	}
 	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
+		// currentTerm might be updated in RequestVote or after lost election but currentLeader might not
+		rf.updateTerm(args.Term, args.Leader)
+	} else if rf.currentLeader == NOBODY {
+		rf.currentLeader = args.Leader
 	}
-	rf.currentLeader = args.Leader // currentTerm might be updated in RequestVote but currentLeader might not
 	if rf.me != rf.currentLeader {
-		atomic.StoreInt32((*int32)(&rf.identity), int32(FOLLOWER))
+		if rf.identity != FOLLOWER { // debug
+			log.Printf("server %v from %v to FOLLOWER\n", rf.me, identityStr(rf.identity))
+		}
+		// reset identity
+		rf.setIdentity(FOLLOWER)
 	}
 }
 
@@ -344,26 +368,37 @@ func (rf *Raft) getIdentity() Identity {
 	return Identity(atomic.LoadInt32((*int32)(&rf.identity)))
 }
 
-func (rf *Raft) doRequestVote() (int, int) {
+func (rf *Raft) doElection() (ElectionResult, int) {
 	args, ch := RequestVoteArgs{rf.me, rf.currentTerm}, make(chan *RequestVoteReply)
 	for i := range rf.peers {
 		go rf.sendRequestVote(i, &args, &ch)
 	}
-	votes, term := 0, rf.currentTerm
+	voted, finished := 0, 0
 	for timeout := time.After(rf.getElectionTimeout()); ; {
 		select {
 		case res := <-ch:
-			switch {
-			case !res.Replied:
-				// rpc call timeout
-				go rf.sendRequestVote(res.Server, &args, &ch)
-			case res.Voted:
-				votes++
-			case res.Term > rf.currentTerm:
-				term = res.Term
+			if res.Term > rf.currentTerm {
+				return LOST, res.Term
+			}
+			finished++
+			if res.Voted {
+				voted++
+			}
+			if voted > len(rf.peers)/2 {
+				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
+				return WON, rf.currentTerm
+			} else if finished-voted > len(rf.peers)/2 {
+				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
+				return LOST, rf.currentTerm
 			}
 		case <-timeout:
-			return votes, term
+			if voted == len(rf.peers)/2 {
+				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
+				return SPLIT, rf.currentTerm
+			} else {
+				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
+				return LOST, rf.currentTerm
+			}
 		default:
 		}
 	}
@@ -377,28 +412,35 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+
+		// where to add lock?
 		switch {
 		// getIdentity each time.
 		case rf.getIdentity() == FOLLOWER:
-			time.Sleep(rf.getElectionTimeout())
 			rf.setIdentity(CANDIDATE)
+			log.Printf("%v FOLLOWER to CANDIDATE in term %v\n", rf.me, rf.currentTerm)
+			time.Sleep(rf.getElectionTimeout())
 		case rf.getIdentity() == CANDIDATE:
+			log.Printf("%v state: CANDIDATE, term: %v\n", rf.me, rf.currentTerm)
 			// identity might be changed
-			rf.currentTerm++
-			votes, term := rf.doRequestVote()
-			if term > rf.currentLeader {
+			rf.updateTerm(rf.currentTerm+1, NOBODY)
+			log.Printf("%v change term to %v and start requesting votes\n", rf.me, rf.currentTerm)
+			res, term := rf.doElection() // term is at least the same as rf.currentTerm
+			log.Printf("%v election result: %v, term %v\n", rf.me, electionResultStr(res), term)
+			if res == LOST {
 				rf.currentTerm = term
 				rf.setIdentity(FOLLOWER)
-			} else if votes > len(rf.peers)/2 {
+			} else if res == WON {
 				rf.setIdentity(LEADER)
 				rf.currentLeader = rf.me
 			}
+			log.Printf("%v CANDIDATE to %v\n", rf.me, identityStr(rf.identity))
 		// temporarily place heartbeats sending logic here for lab2a
 		case rf.getIdentity() == LEADER:
 			term, leader := rf.doAppendEntries()
 			if term > rf.currentTerm {
-				rf.currentTerm, rf.currentLeader = term, leader
-				rf.setIdentity(FOLLOWER)
+				rf.updateTerm(term, leader)
+				log.Printf("%v LEADER to %v\n", rf.me, identityStr(rf.identity))
 			}
 		}
 	}
@@ -437,4 +479,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+// debug functions
+func identityStr(identity Identity) string {
+	ret := ""
+	switch identity {
+	case FOLLOWER:
+		ret = "FOLLOWER"
+	case CANDIDATE:
+		ret = "CANDIDATE"
+	case LEADER:
+		ret = "LEADER"
+	}
+	return ret
+}
+
+func electionResultStr(res ElectionResult) string {
+	ret := ""
+	switch res {
+	case WON:
+		ret = "WON"
+	case LOST:
+		ret = "LOST"
+	case SPLIT:
+		ret = "SPLIT"
+	}
+	return ret
 }
