@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -116,6 +118,41 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
+	}
+
+	cfg.checkOneLeader()
+
+	cfg.end()
+}
+
+func TestCustomElections2A(t *testing.T) {
+	n := 10
+	servers := 2*n + 1
+	cfg := make_config(t, servers, false, false)
+	defer cfg.cleanup()
+
+	cfg.begin("Test (2A): custom elections")
+
+	cfg.checkOneLeader()
+
+	iters := 10
+	for ii := 1; ii < iters; ii++ {
+		// disconnect random nodes
+		disconnections := make([]int, 0, n)
+		for i := 0; i < n; i++ {
+			disconnections = append(disconnections, rand.Int()%servers)
+		}
+		for _, server := range disconnections {
+			cfg.disconnect(server)
+		}
+
+		// either the current leader should still be alive,
+		// or the remaining servers should elect a new one.
+		cfg.checkOneLeader()
+
+		for _, server := range disconnections {
+			cfg.connect(server)
+		}
 	}
 
 	cfg.checkOneLeader()
