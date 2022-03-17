@@ -19,7 +19,6 @@ package raft
 
 import (
 	//	"bytes"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -93,6 +92,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isleader = rf.identity == LEADER
 	return term, isleader
@@ -156,13 +157,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-func (rf *Raft) updateTerm(term int, leader int) {
-	rf.currentLeader = leader
-	rf.currentTerm = term
-	rf.votedFor = NOBODY
-	rf.setIdentity(FOLLOWER)
-}
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -197,21 +191,17 @@ func (rf *Raft) voteFor(args *RequestVoteArgs) bool {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// a candidate would never send this to itself
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.currentTerm < args.Term {
-		log.Printf("%v set term to %v in RequestVote and become follower\n", rf.me, args.Term)
-		rf.updateTerm(args.Term, NOBODY)
+		rf.currentTerm, rf.currentLeader, rf.votedFor, rf.identity = args.Term, NOBODY, NOBODY, FOLLOWER
 	}
 	if rf.voteFor(args) {
-		log.Printf("%v current votedFor: %v at term %v\n", rf.me, rf.votedFor, rf.currentTerm)
 		rf.votedFor = args.Me
 		reply.Voted = true
-	} else {
-		reply.Voted = false
 	}
 	reply.Term = rf.currentTerm
-	log.Printf("%v(term: %v) response to %v(term: %v): %v\n", rf.me, rf.currentTerm, args.Me, args.Term, reply.Voted)
 }
 
 //
@@ -270,23 +260,18 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// log.Printf("%v received heartbeat from %v\n", rf.me, args.Leader)
 	if rf.currentTerm > args.Term {
 		reply.Term, reply.Leader = rf.currentTerm, rf.currentLeader
 		return
-	}
-	if rf.currentTerm < args.Term {
+	} else if rf.currentTerm < args.Term {
 		// currentTerm might be updated in RequestVote or after lost election but currentLeader might not
-		rf.updateTerm(args.Term, args.Leader)
+		rf.currentTerm, rf.currentLeader, rf.votedFor, rf.identity = args.Term, args.Leader, NOBODY, FOLLOWER
 	} else if rf.currentLeader == NOBODY {
 		rf.currentLeader = args.Leader
 	}
 	if rf.me != rf.currentLeader {
-		if rf.identity != FOLLOWER { // debug
-			log.Printf("server %v from %v to FOLLOWER\n", rf.me, identityStr(rf.identity))
-		}
 		// reset identity
-		rf.setIdentity(FOLLOWER)
+		rf.identity = FOLLOWER
 	}
 }
 
@@ -296,19 +281,26 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, ch *chan 
 	*ch <- reply
 }
 
-func (rf *Raft) doAppendEntries() (int, int) {
-	args, ch := AppendEntriesArgs{rf.currentTerm, rf.me}, make(chan *AppendEntriesReply, len(rf.peers))
+func (rf *Raft) doAppendEntries(curTerm int) (int, int) {
+	// no read/write on rf's non-persistent state (e.g. rf.me)
+	args, ch := AppendEntriesArgs{curTerm, rf.me}, make(chan *AppendEntriesReply, len(rf.peers))
 	for i := range rf.peers {
-		go rf.sendAppendEntries(i, &args, &ch)
-	}
-	term, leader := rf.currentTerm, rf.me
-	for range rf.peers {
-		res := <-ch
-		if res.Replied && res.Term > term {
-			term, leader = res.Term, res.Leader
+		if i != rf.me {
+			go rf.sendAppendEntries(i, &args, &ch)
 		}
 	}
-	return term, leader
+	term, leader := curTerm, rf.me
+	for interval := time.After(time.Duration(100) * time.Millisecond); ; {
+		select {
+		case res := <-ch:
+			if res.Replied && res.Term > term {
+				term, leader = res.Term, res.Leader
+			}
+		case <-interval:
+			return term, leader
+		default:
+		}
+	}
 }
 
 //
@@ -360,24 +352,19 @@ func (rf *Raft) getElectionTimeout() time.Duration {
 	return time.Duration(250+rand.Intn(250)) * time.Millisecond
 }
 
-func (rf *Raft) setIdentity(identity Identity) {
-	atomic.StoreInt32((*int32)(&rf.identity), int32(identity))
-}
-
-func (rf *Raft) getIdentity() Identity {
-	return Identity(atomic.LoadInt32((*int32)(&rf.identity)))
-}
-
-func (rf *Raft) doElection() (ElectionResult, int) {
-	args, ch := RequestVoteArgs{rf.me, rf.currentTerm}, make(chan *RequestVoteReply)
+func (rf *Raft) doElection(term int) (ElectionResult, int) {
+	// no read/write on rf's non-persistent state (e.g. rf.me)
+	args, ch := RequestVoteArgs{rf.me, term}, make(chan *RequestVoteReply)
+	voted, finished := 1, 1
 	for i := range rf.peers {
-		go rf.sendRequestVote(i, &args, &ch)
+		if i != rf.me {
+			go rf.sendRequestVote(i, &args, &ch)
+		}
 	}
-	voted, finished := 0, 0
 	for timeout := time.After(rf.getElectionTimeout()); ; {
 		select {
 		case res := <-ch:
-			if res.Term > rf.currentTerm {
+			if res.Term > term {
 				return LOST, res.Term
 			}
 			finished++
@@ -385,19 +372,15 @@ func (rf *Raft) doElection() (ElectionResult, int) {
 				voted++
 			}
 			if voted > len(rf.peers)/2 {
-				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
-				return WON, rf.currentTerm
+				return WON, term
 			} else if finished-voted > len(rf.peers)/2 {
-				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
-				return LOST, rf.currentTerm
+				return LOST, term
 			}
 		case <-timeout:
-			if voted == len(rf.peers)/2 {
-				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
-				return SPLIT, rf.currentTerm
+			if len(rf.peers)%2 == 0 && voted == len(rf.peers)/2 {
+				return SPLIT, term
 			} else {
-				log.Printf("term election result: server %v - %v/%v\n", rf.me, voted, finished)
-				return LOST, rf.currentTerm
+				return LOST, term
 			}
 		default:
 		}
@@ -414,34 +397,41 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 
 		// where to add lock?
-		switch {
-		// getIdentity each time.
-		case rf.getIdentity() == FOLLOWER:
-			rf.setIdentity(CANDIDATE)
-			log.Printf("%v FOLLOWER to CANDIDATE in term %v\n", rf.me, rf.currentTerm)
+		rf.mu.Lock()
+		curTerm := rf.currentTerm
+		switch rf.identity {
+		case FOLLOWER:
+			rf.identity = CANDIDATE
+			rf.mu.Unlock()
 			time.Sleep(rf.getElectionTimeout())
-		case rf.getIdentity() == CANDIDATE:
-			log.Printf("%v state: CANDIDATE, term: %v\n", rf.me, rf.currentTerm)
+		case CANDIDATE:
 			// identity might be changed
-			rf.updateTerm(rf.currentTerm+1, NOBODY)
-			log.Printf("%v change term to %v and start requesting votes\n", rf.me, rf.currentTerm)
-			res, term := rf.doElection() // term is at least the same as rf.currentTerm
-			log.Printf("%v election result: %v, term %v\n", rf.me, electionResultStr(res), term)
-			if res == LOST {
-				rf.currentTerm = term
-				rf.setIdentity(FOLLOWER)
-			} else if res == WON {
-				rf.setIdentity(LEADER)
-				rf.currentLeader = rf.me
-			}
-			log.Printf("%v CANDIDATE to %v\n", rf.me, identityStr(rf.identity))
-		// temporarily place heartbeats sending logic here for lab2a
-		case rf.getIdentity() == LEADER:
-			term, leader := rf.doAppendEntries()
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.mu.Unlock()
+			res, term := rf.doElection(rf.currentTerm) // term is at least the same as rf.currentTerm
+			rf.mu.Lock()
 			if term > rf.currentTerm {
-				rf.updateTerm(term, leader)
-				log.Printf("%v LEADER to %v\n", rf.me, identityStr(rf.identity))
+				rf.currentTerm, rf.votedFor, rf.identity = term, NOBODY, FOLLOWER
+			} else {
+				switch res {
+				case LOST:
+					rf.identity = FOLLOWER
+				case WON:
+					rf.identity, rf.currentLeader = LEADER, rf.me
+				}
 			}
+			rf.mu.Unlock()
+		// temporarily place heartbeats sending logic here for lab2a
+		case LEADER:
+			rf.mu.Unlock()
+			term, leader := rf.doAppendEntries(curTerm)
+			rf.mu.Lock()
+			if term > rf.currentTerm {
+				// compare term with rf.currentTerm instead of curTerm
+				rf.currentTerm, rf.currentLeader, rf.identity, rf.votedFor = term, leader, FOLLOWER, NOBODY
+			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -479,31 +469,4 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
-}
-
-// debug functions
-func identityStr(identity Identity) string {
-	ret := ""
-	switch identity {
-	case FOLLOWER:
-		ret = "FOLLOWER"
-	case CANDIDATE:
-		ret = "CANDIDATE"
-	case LEADER:
-		ret = "LEADER"
-	}
-	return ret
-}
-
-func electionResultStr(res ElectionResult) string {
-	ret := ""
-	switch res {
-	case WON:
-		ret = "WON"
-	case LOST:
-		ret = "LOST"
-	case SPLIT:
-		ret = "SPLIT"
-	}
-	return ret
 }
