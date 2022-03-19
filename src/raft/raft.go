@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,19 +29,15 @@ import (
 	"6.824/labrpc"
 )
 
-type Identity int32
-type ElectionResult int
+type Identity int
 
 const (
 	FOLLOWER  Identity = 0
 	CANDIDATE Identity = 1
 	LEADER    Identity = 2
 
-	WON   ElectionResult = 0
-	LOST  ElectionResult = 1
-	SPLIT ElectionResult = 2
-
-	NOBODY int = -1
+	NULL int = -1
+	NA   int = -2
 )
 
 //
@@ -83,6 +80,14 @@ type Raft struct {
 	currentLeader int
 	identity      Identity
 	votedFor      int
+
+	// log         []interface{}
+	// commitIndex int
+
+	// nextIndex  []int
+	// matchIndex []int
+
+	statePatchChan chan *statePatch
 }
 
 // return currentTerm and whether this server
@@ -94,6 +99,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	term = rf.currentTerm
 	isleader = rf.identity == LEADER
 	return term, isleader
@@ -177,31 +183,30 @@ type RequestVoteReply struct {
 	Term  int
 }
 
-func (rf *Raft) voteFor(args *RequestVoteArgs) bool {
-	if rf.currentTerm > args.Term {
-		return false
-	} else {
-		// for 2A we blindly vote for whoever sends the request first
-		return rf.votedFor == NOBODY
-	}
-}
-
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// a candidate would never send this to itself
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.currentTerm < args.Term {
-		rf.currentTerm, rf.currentLeader, rf.votedFor, rf.identity = args.Term, NOBODY, NOBODY, FOLLOWER
+
+	if rf.currentTerm > args.Term {
+		reply.Term, reply.Voted = rf.currentTerm, false
+		rf.mu.Unlock()
+	} else {
+		reply.Term = args.Term
+		patch := NO_ACTION()
+		if rf.currentTerm < args.Term {
+			patch.term, patch.leader, patch.votedFor, patch.identity = args.Term, NULL, NULL, FOLLOWER
+		}
+		if (rf.votedFor == NULL || patch.votedFor == NULL) && true {
+			// for 2A we blindly vote for whoever sends the request first
+			reply.Voted = true
+			patch.votedFor = args.Me
+		}
+		rf.statePatchChan <- &patch
+		// mutex would be unlocked in applyPatch
 	}
-	if rf.voteFor(args) {
-		rf.votedFor = args.Me
-		reply.Voted = true
-	}
-	reply.Term = rf.currentTerm
 }
 
 //
@@ -233,11 +238,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, ch *chan *RequestVoteReply) {
-	reply := &RequestVoteReply{}
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		*ch <- reply
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, ch *chan *RequestVoteReply) {
+	if server != rf.me {
+		reply := RequestVoteReply{}
+		if rf.peers[server].Call("Raft.RequestVote", &args, &reply) {
+			*ch <- &reply
+		}
 	}
 }
 
@@ -250,55 +256,28 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term   int
-	Leader int
-
-	// addition info
-	Replied bool
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	if rf.currentTerm > args.Term {
-		reply.Term, reply.Leader = rf.currentTerm, rf.currentLeader
-		return
-	} else if rf.currentTerm < args.Term {
-		// currentTerm might be updated in RequestVote or after lost election but currentLeader might not
-		rf.currentTerm, rf.currentLeader, rf.votedFor, rf.identity = args.Term, args.Leader, NOBODY, FOLLOWER
-	} else if rf.currentLeader == NOBODY {
-		rf.currentLeader = args.Leader
-	}
-	if rf.me != rf.currentLeader {
-		// reset identity
-		rf.identity = FOLLOWER
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+	} else {
+		reply.Term, reply.Success = rf.currentTerm, true // Success is always true for lab2a
+		rf.statePatchChan <- &statePatch{args.Term, args.Leader, NA, FOLLOWER}
+		// mutex would be unlocked in applyPatch
 	}
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, ch *chan *AppendEntriesReply) {
-	reply := &AppendEntriesReply{}
-	reply.Replied = rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	*ch <- reply
-}
-
-func (rf *Raft) doAppendEntries(curTerm int) (int, int) {
-	// no read/write on rf's non-persistent state (e.g. rf.me)
-	args, ch := AppendEntriesArgs{curTerm, rf.me}, make(chan *AppendEntriesReply, len(rf.peers))
-	for i := range rf.peers {
-		if i != rf.me {
-			go rf.sendAppendEntries(i, &args, &ch)
-		}
-	}
-	term, leader := curTerm, rf.me
-	for interval := time.After(time.Duration(100) * time.Millisecond); ; {
-		select {
-		case res := <-ch:
-			if res.Replied && res.Term > term {
-				term, leader = res.Term, res.Leader
-			}
-		case <-interval:
-			return term, leader
-		default:
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, ch *chan *AppendEntriesReply) {
+	if server != rf.me {
+		reply := AppendEntriesReply{}
+		if rf.peers[server].Call("Raft.AppendEntries", &args, &reply) {
+			*ch <- &reply
 		}
 	}
 }
@@ -352,87 +331,121 @@ func (rf *Raft) getElectionTimeout() time.Duration {
 	return time.Duration(250+rand.Intn(250)) * time.Millisecond
 }
 
-func (rf *Raft) doElection(term int) (ElectionResult, int) {
-	// no read/write on rf's non-persistent state (e.g. rf.me)
-	args, ch := RequestVoteArgs{rf.me, term}, make(chan *RequestVoteReply)
+func NO_ACTION() statePatch {
+	return statePatch{NA, NA, NA, Identity(NA)}
+}
+
+type statePatch struct {
+	// fields pending
+	term     int
+	leader   int
+	votedFor int
+	identity Identity
+}
+
+func (rf *Raft) follower() *statePatch {
+	var ret *statePatch
+	select {
+	case patch := <-rf.statePatchChan:
+		ret = patch
+	case <-time.After(rf.getElectionTimeout()):
+		rf.mu.Lock() // would be unlocked in applyPatch
+		ret = &statePatch{rf.currentTerm + 1, NULL, rf.me, CANDIDATE}
+	}
+	return ret
+}
+
+func (rf *Raft) candidate() *statePatch {
+	var ret *statePatch
+	// no need to add lock when reading currentTerm here
+	args, ch := RequestVoteArgs{rf.me, rf.currentTerm}, make(chan *RequestVoteReply)
 	voted, finished := 1, 1
 	for i := range rf.peers {
-		if i != rf.me {
-			go rf.sendRequestVote(i, &args, &ch)
-		}
+		go rf.sendRequestVote(i, args, &ch)
 	}
-	for timeout := time.After(rf.getElectionTimeout()); ; {
+	for timeout := time.After(rf.getElectionTimeout()); ret == nil; {
 		select {
+		case ret = <-rf.statePatchChan:
 		case res := <-ch:
-			if res.Term > term {
-				return LOST, res.Term
-			}
-			finished++
-			if res.Voted {
-				voted++
-			}
-			if voted > len(rf.peers)/2 {
-				return WON, term
-			} else if finished-voted > len(rf.peers)/2 {
-				return LOST, term
+			rf.mu.Lock()
+			if res.Term > rf.currentTerm {
+				ret = &statePatch{res.Term, NULL, NULL, FOLLOWER}
+			} else {
+				finished++
+				if res.Voted {
+					voted++
+				}
+				if voted > len(rf.peers)/2 {
+					ret = &statePatch{rf.currentTerm, rf.me, NA, LEADER}
+				} else if finished-voted > len(rf.peers)/2 {
+					ret = &statePatch{rf.currentTerm, NULL, NA, FOLLOWER}
+				} else {
+					rf.mu.Unlock()
+				}
 			}
 		case <-timeout:
-			if len(rf.peers)%2 == 0 && voted == len(rf.peers)/2 {
-				return SPLIT, term
-			} else {
-				return LOST, term
-			}
-		default:
+			rf.mu.Lock()
+			ret = &statePatch{rf.currentTerm + 1, NULL, rf.me, CANDIDATE}
 		}
 	}
+	return ret
+}
+
+func (rf *Raft) leader() *statePatch {
+	var ret *statePatch
+	args, ch := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.currentLeader}, make(chan *AppendEntriesReply, len(rf.peers))
+	for tick := time.NewTicker(100 * time.Millisecond); ret == nil; {
+		select {
+		case ret = <-rf.statePatchChan:
+		case res := <-ch:
+			rf.mu.Lock()
+			if res.Term > rf.currentTerm {
+				ret = &statePatch{res.Term, NULL, NULL, FOLLOWER}
+			} else {
+				rf.mu.Unlock()
+			}
+		case <-tick.C:
+			for i := range rf.peers {
+				go rf.sendAppendEntries(i, args, &ch)
+			}
+		}
+	}
+	return ret
+}
+
+func applyIfApplicable(p *int, v int) {
+	if v != NA {
+		*p = v
+	}
+}
+
+func (rf *Raft) applyPatch(patch *statePatch) {
+	applyIfApplicable(&rf.currentTerm, patch.term)
+	applyIfApplicable(&rf.currentLeader, patch.leader)
+	applyIfApplicable(&rf.votedFor, patch.votedFor)
+	applyIfApplicable((*int)(&rf.identity), int(patch.identity))
+	rf.mu.Unlock()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
-		// where to add lock?
-		rf.mu.Lock()
-		curTerm := rf.currentTerm
+		var patch *statePatch
 		switch rf.identity {
 		case FOLLOWER:
-			rf.identity = CANDIDATE
-			rf.mu.Unlock()
-			time.Sleep(rf.getElectionTimeout())
+			patch = rf.follower()
 		case CANDIDATE:
-			// identity might be changed
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			rf.mu.Unlock()
-			res, term := rf.doElection(rf.currentTerm) // term is at least the same as rf.currentTerm
-			rf.mu.Lock()
-			if term > rf.currentTerm {
-				rf.currentTerm, rf.votedFor, rf.identity = term, NOBODY, FOLLOWER
-			} else {
-				switch res {
-				case LOST:
-					rf.identity = FOLLOWER
-				case WON:
-					rf.identity, rf.currentLeader = LEADER, rf.me
-				}
-			}
-			rf.mu.Unlock()
-		// temporarily place heartbeats sending logic here for lab2a
+			patch = rf.candidate()
 		case LEADER:
-			rf.mu.Unlock()
-			term, leader := rf.doAppendEntries(curTerm)
-			rf.mu.Lock()
-			if term > rf.currentTerm {
-				// compare term with rf.currentTerm instead of curTerm
-				rf.currentTerm, rf.currentLeader, rf.identity, rf.votedFor = term, leader, FOLLOWER, NOBODY
-			}
-			rf.mu.Unlock()
+			patch = rf.leader()
 		}
+		rf.applyPatch(patch)
 	}
 }
 
@@ -456,9 +469,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.currentLeader = NOBODY
+	rf.currentLeader = NULL
 	rf.identity = FOLLOWER
-	rf.votedFor = NOBODY
+	rf.votedFor = NULL
+
+	rf.statePatchChan = make(chan *statePatch)
 
 	rand.Seed(time.Now().UnixNano())
 
