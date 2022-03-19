@@ -37,7 +37,6 @@ const (
 	LEADER    Identity = 2
 
 	NULL int = -1
-	NA   int = -2
 )
 
 //
@@ -87,7 +86,7 @@ type Raft struct {
 	// nextIndex  []int
 	// matchIndex []int
 
-	statePatchChan chan *statePatch
+	stateChan chan bool
 }
 
 // return currentTerm and whether this server
@@ -189,23 +188,24 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if rf.currentTerm > args.Term {
 		reply.Term, reply.Voted = rf.currentTerm, false
-		rf.mu.Unlock()
-	} else {
-		reply.Term = args.Term
-		patch := NO_ACTION()
-		if rf.currentTerm < args.Term {
-			patch.term, patch.leader, patch.votedFor, patch.identity = args.Term, NULL, NULL, FOLLOWER
-		}
-		if (rf.votedFor == NULL || patch.votedFor == NULL) && true {
-			// for 2A we blindly vote for whoever sends the request first
-			reply.Voted = true
-			patch.votedFor = args.Me
-		}
-		rf.statePatchChan <- &patch
-		// mutex would be unlocked in applyPatch
+		return
+	}
+
+	reply.Term = args.Term
+	if rf.currentTerm < args.Term {
+		rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = args.Term, FOLLOWER, NULL, NULL
+		rf.stateChan <- true
+	} else if rf.identity == FOLLOWER {
+		rf.stateChan <- true
+	}
+	if rf.votedFor == NULL && true {
+		// for 2A we blindly vote for whoever sends the request first
+		reply.Voted = true
+		rf.votedFor = args.Me
 	}
 }
 
@@ -262,15 +262,18 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
-	} else {
-		reply.Term, reply.Success = rf.currentTerm, true // Success is always true for lab2a
-		rf.statePatchChan <- &statePatch{args.Term, args.Leader, NA, FOLLOWER}
-		// mutex would be unlocked in applyPatch
+		return
 	}
+	if rf.identity == FOLLOWER {
+		rf.stateChan <- true // heartbeat
+	}
+
+	reply.Term, reply.Success = rf.currentTerm, true // always true for lab2a
+	rf.currentTerm, rf.identity, rf.currentLeader = args.Term, FOLLOWER, args.Leader
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, ch *chan *AppendEntriesReply) {
@@ -328,79 +331,79 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) getElectionTimeout() time.Duration {
-	return time.Duration(250+rand.Intn(250)) * time.Millisecond
+	return time.Duration(300+rand.Intn(300)) * time.Millisecond
 }
 
-func NO_ACTION() statePatch {
-	return statePatch{NA, NA, NA, Identity(NA)}
-}
-
-type statePatch struct {
-	// fields pending
-	term     int
-	leader   int
-	votedFor int
-	identity Identity
-}
-
-func (rf *Raft) follower() *statePatch {
-	var ret *statePatch
+func (rf *Raft) follower() {
+	rf.mu.Unlock()
+begin:
+	timeout := time.After(rf.getElectionTimeout())
 	select {
-	case patch := <-rf.statePatchChan:
-		ret = patch
-	case <-time.After(rf.getElectionTimeout()):
-		rf.mu.Lock() // would be unlocked in applyPatch
-		ret = &statePatch{rf.currentTerm + 1, NULL, rf.me, CANDIDATE}
+	case <-rf.stateChan: // used here to indicate heartbeat
+		goto begin
+	case <-timeout:
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = rf.currentTerm+1, CANDIDATE, NULL, rf.me
 	}
-	return ret
 }
 
-func (rf *Raft) candidate() *statePatch {
-	var ret *statePatch
-	// no need to add lock when reading currentTerm here
-	args, ch := RequestVoteArgs{rf.me, rf.currentTerm}, make(chan *RequestVoteReply)
+func (rf *Raft) candidate() {
+begin:
+	args := RequestVoteArgs{rf.me, rf.currentTerm}
+	rf.mu.Unlock()
+	ch := make(chan *RequestVoteReply)
 	voted, finished := 1, 1
 	for i := range rf.peers {
 		go rf.sendRequestVote(i, args, &ch)
 	}
-	for timeout := time.After(rf.getElectionTimeout()); ret == nil; {
+loop:
+	for timeout := time.After(rf.getElectionTimeout()); ; {
 		select {
-		case ret = <-rf.statePatchChan:
+		case <-rf.stateChan:
+			return
 		case res := <-ch:
 			rf.mu.Lock()
 			if res.Term > rf.currentTerm {
-				ret = &statePatch{res.Term, NULL, NULL, FOLLOWER}
+				rf.currentTerm, rf.identity, rf.votedFor, rf.votedFor = res.Term, FOLLOWER, NULL, NULL
+				break loop
 			} else {
 				finished++
 				if res.Voted {
 					voted++
 				}
 				if voted > len(rf.peers)/2 {
-					ret = &statePatch{rf.currentTerm, rf.me, NA, LEADER}
+					rf.identity, rf.currentLeader = LEADER, rf.me
+					break loop
 				} else if finished-voted > len(rf.peers)/2 {
-					ret = &statePatch{rf.currentTerm, NULL, NA, FOLLOWER}
-				} else {
-					rf.mu.Unlock()
+					rf.identity = FOLLOWER
+					break loop
 				}
+				rf.mu.Unlock()
 			}
 		case <-timeout:
 			rf.mu.Lock()
-			ret = &statePatch{rf.currentTerm + 1, NULL, rf.me, CANDIDATE}
+			rf.currentTerm++
+			goto begin // use goto to avoid nesting for loops
 		}
 	}
-	return ret
+	rf.mu.Unlock()
 }
 
-func (rf *Raft) leader() *statePatch {
-	var ret *statePatch
-	args, ch := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.currentLeader}, make(chan *AppendEntriesReply, len(rf.peers))
-	for tick := time.NewTicker(100 * time.Millisecond); ret == nil; {
+func (rf *Raft) leader() {
+	args := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.currentLeader}
+	rf.mu.Unlock()
+	ch := make(chan *AppendEntriesReply, len(rf.peers))
+loop:
+	for tick := time.NewTicker(120 * time.Millisecond); ; {
 		select {
-		case ret = <-rf.statePatchChan:
+		case <-rf.stateChan:
+			return
 		case res := <-ch:
 			rf.mu.Lock()
 			if res.Term > rf.currentTerm {
-				ret = &statePatch{res.Term, NULL, NULL, FOLLOWER}
+				rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = res.Term, FOLLOWER, NULL, NULL
+				break loop
 			} else {
 				rf.mu.Unlock()
 			}
@@ -410,20 +413,6 @@ func (rf *Raft) leader() *statePatch {
 			}
 		}
 	}
-	return ret
-}
-
-func applyIfApplicable(p *int, v int) {
-	if v != NA {
-		*p = v
-	}
-}
-
-func (rf *Raft) applyPatch(patch *statePatch) {
-	applyIfApplicable(&rf.currentTerm, patch.term)
-	applyIfApplicable(&rf.currentLeader, patch.leader)
-	applyIfApplicable(&rf.votedFor, patch.votedFor)
-	applyIfApplicable((*int)(&rf.identity), int(patch.identity))
 	rf.mu.Unlock()
 }
 
@@ -436,16 +425,15 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
-		var patch *statePatch
+		rf.mu.Lock()
 		switch rf.identity {
 		case FOLLOWER:
-			patch = rf.follower()
+			rf.follower()
 		case CANDIDATE:
-			patch = rf.candidate()
+			rf.candidate()
 		case LEADER:
-			patch = rf.leader()
+			rf.leader()
 		}
-		rf.applyPatch(patch)
 	}
 }
 
@@ -473,7 +461,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.identity = FOLLOWER
 	rf.votedFor = NULL
 
-	rf.statePatchChan = make(chan *statePatch)
+	rf.stateChan = make(chan bool)
 
 	rand.Seed(time.Now().UnixNano())
 
