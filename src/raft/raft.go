@@ -37,6 +37,9 @@ const (
 	LEADER    Identity = 2
 
 	NULL int = -1
+
+	HEARTBEAT_INTERVAL      = 100
+	ELECTION_TIMEOUT_FACTOR = 2
 )
 
 //
@@ -86,7 +89,7 @@ type Raft struct {
 	// nextIndex  []int
 	// matchIndex []int
 
-	stateChan chan bool
+	heartbeat chan bool
 }
 
 // return currentTerm and whether this server
@@ -192,20 +195,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.currentTerm > args.Term {
 		reply.Term, reply.Voted = rf.currentTerm, false
-		return
-	}
-
-	reply.Term = args.Term
-	if rf.currentTerm < args.Term {
-		rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = args.Term, FOLLOWER, NULL, NULL
-		rf.stateChan <- true
-	} else if rf.identity == FOLLOWER {
-		rf.stateChan <- true
-	}
-	if rf.votedFor == NULL && true {
-		// for 2A we blindly vote for whoever sends the request first
-		reply.Voted = true
-		rf.votedFor = args.Me
+	} else {
+		reply.Term = args.Term
+		if rf.identity == FOLLOWER {
+			rf.heartbeat <- true
+		}
+		if rf.currentTerm < args.Term {
+			rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = args.Term, FOLLOWER, NULL, NULL
+		}
+		if rf.votedFor == NULL && true {
+			// for 2A we blindly vote for whoever sends the request first
+			reply.Voted = true
+			rf.votedFor = args.Me
+		}
 	}
 }
 
@@ -266,14 +268,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
-		return
+	} else {
+		if rf.identity == FOLLOWER {
+			rf.heartbeat <- true
+		}
+		rf.currentTerm, rf.identity, rf.currentLeader = args.Term, FOLLOWER, args.Leader
+		reply.Term, reply.Success = rf.currentTerm, true // always true for lab2a
 	}
-	if rf.identity == FOLLOWER {
-		rf.stateChan <- true // heartbeat
-	}
-
-	reply.Term, reply.Success = rf.currentTerm, true // always true for lab2a
-	rf.currentTerm, rf.identity, rf.currentLeader = args.Term, FOLLOWER, args.Leader
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, ch *chan *AppendEntriesReply) {
@@ -331,7 +332,8 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) getElectionTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(300)) * time.Millisecond
+	base := HEARTBEAT_INTERVAL * ELECTION_TIMEOUT_FACTOR
+	return time.Duration(base+rand.Intn(base)) * time.Millisecond
 }
 
 func (rf *Raft) follower() {
@@ -339,7 +341,7 @@ func (rf *Raft) follower() {
 begin:
 	timeout := time.After(rf.getElectionTimeout())
 	select {
-	case <-rf.stateChan: // used here to indicate heartbeat
+	case <-rf.heartbeat:
 		goto begin
 	case <-timeout:
 		rf.mu.Lock()
@@ -349,71 +351,66 @@ begin:
 }
 
 func (rf *Raft) candidate() {
-begin:
 	args := RequestVoteArgs{rf.me, rf.currentTerm}
 	rf.mu.Unlock()
-	ch := make(chan *RequestVoteReply)
+	ch := make(chan *RequestVoteReply, len(rf.peers))
 	voted, finished := 1, 1
 	for i := range rf.peers {
 		go rf.sendRequestVote(i, args, &ch)
 	}
-loop:
-	for timeout := time.After(rf.getElectionTimeout()); ; {
+	for loop, timeout := true, time.After(rf.getElectionTimeout()); loop; {
 		select {
-		case <-rf.stateChan:
-			return
 		case res := <-ch:
-			rf.mu.Lock()
+			loop = false
+			rf.mu.Lock() // critical section start
 			if res.Term > rf.currentTerm {
 				rf.currentTerm, rf.identity, rf.votedFor, rf.votedFor = res.Term, FOLLOWER, NULL, NULL
-				break loop
-			} else {
+			} else if rf.identity == CANDIDATE {
 				finished++
 				if res.Voted {
 					voted++
 				}
 				if voted > len(rf.peers)/2 {
 					rf.identity, rf.currentLeader = LEADER, rf.me
-					break loop
 				} else if finished-voted > len(rf.peers)/2 {
 					rf.identity = FOLLOWER
-					break loop
+				} else {
+					loop = true
 				}
-				rf.mu.Unlock()
 			}
+			rf.mu.Unlock() // critical section end
 		case <-timeout:
+			loop = false
 			rf.mu.Lock()
-			rf.currentTerm++
-			goto begin // use goto to avoid nesting for loops
+			defer rf.mu.Unlock()
+			if rf.identity == CANDIDATE {
+				rf.currentTerm++
+			}
 		}
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) leader() {
 	args := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.currentLeader}
 	rf.mu.Unlock()
 	ch := make(chan *AppendEntriesReply, len(rf.peers))
-loop:
-	for tick := time.NewTicker(120 * time.Millisecond); ; {
+	for loop, tick := true, time.NewTicker(HEARTBEAT_INTERVAL*time.Millisecond); loop; {
 		select {
-		case <-rf.stateChan:
-			return
 		case res := <-ch:
-			rf.mu.Lock()
+			rf.mu.Lock() // critical section start
 			if res.Term > rf.currentTerm {
 				rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = res.Term, FOLLOWER, NULL, NULL
-				break loop
-			} else {
-				rf.mu.Unlock()
+				loop = false
+			} else if rf.identity != LEADER {
+				loop = false
 			}
+			rf.mu.Unlock() // critical section end
 		case <-tick.C:
 			for i := range rf.peers {
 				go rf.sendAppendEntries(i, args, &ch)
 			}
 		}
 	}
-	rf.mu.Unlock()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -461,7 +458,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.identity = FOLLOWER
 	rf.votedFor = NULL
 
-	rf.stateChan = make(chan bool)
+	rf.heartbeat = make(chan bool, len(rf.peers)*ELECTION_TIMEOUT_FACTOR*2)
 
 	rand.Seed(time.Now().UnixNano())
 
