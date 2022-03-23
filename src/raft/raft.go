@@ -44,7 +44,7 @@ const (
 	HEARTBEAT_INTERVAL      = 100
 	ELECTION_TIMEOUT_FACTOR = 2
 
-	MAX_ENTRIES_LEN = 50
+	MAX_ENTRIES_LEN = 10000
 )
 
 //
@@ -291,8 +291,6 @@ type AppendEntriesReply struct {
 	Success bool
 
 	// used when RPC fails
-	LastTerm   int
-	LastIndex  int
 	FirstIndex int
 }
 
@@ -314,7 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 	} else {
-		reply.Term, reply.LastIndex = args.Term, len(rf.log)-1
+		reply.Term = args.Term
 		shouldPersist := false
 
 		if rf.identity == FOLLOWER {
@@ -326,7 +324,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.identity, rf.currentLeader = FOLLOWER, args.LeaderId
 		if len(rf.log) > args.PrevLogIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
-			lastLogEntry, length := rf.log[reply.LastIndex], len(rf.log)
+			lastLogEntry, length := rf.log[len(rf.log)-1], len(rf.log)
 
 			for i, entry := range args.Entries {
 				if args.PrevLogIndex+i+1 < len(rf.log) {
@@ -345,8 +343,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				go rf.applyCommittedEntries()
 			}
 		} else {
-			reply.LastTerm = rf.log[reply.LastIndex].Term
-			for i := reply.LastIndex; rf.log[i].Term == rf.log[reply.LastIndex].Term; i-- {
+			reply.FirstIndex = 1
+			index := min(args.PrevLogIndex, len(rf.log)-1) // might be 0, causing PrevLogIndex to be -1
+			for i := index; i > 0 && rf.log[i].Term == rf.log[index].Term; i-- {
 				reply.FirstIndex = i
 			}
 		}
@@ -355,6 +354,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.persist()
 		}
 	}
+	// log.Printf("args.Term: %v, rf.currentTerm: %v, reply.success: %v, reply.FirstIndex: %v\n", args.Term, rf.currentTerm, reply.Success, reply.FirstIndex)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
@@ -365,19 +365,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 		reply := &AppendEntriesReply{}
 		if rf.peers[server].Call("Raft.AppendEntries", args, reply) {
 			rf.mu.Lock()
+			// old := rf.nextIndex[server] // debug
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm, rf.identity, rf.currentLeader, rf.votedFor = reply.Term, FOLLOWER, NULL, NULL
 				rf.persist()
-			} else if reply.Success {
-				rf.nextIndex[server] += len(args.Entries)
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-			} else {
-				if reply.LastTerm == args.Term {
-					rf.nextIndex[server] = reply.LastIndex + 1
-				} else {
-					rf.nextIndex[server] = reply.FirstIndex
+			} else if rf.identity == LEADER {
+				if reply.Success {
+					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
+					// log.Printf("rf.nextIndex: %v\n", rf.nextIndex[server])
+				} else if reply.Term == args.Term {
+					rf.nextIndex[server] = min(reply.FirstIndex, len(rf.log))
+					// log.Printf("reply.FirstIndex: %v, len(rf.log): %v\n", reply.FirstIndex, len(rf.log))
+					// log.Printf("currentTerm: %v, args.Term: %v\n", rf.currentTerm, args.Term)
+
+					// rf.nextIndex[server]--
 				}
 			}
+			// log.Printf("%v receive %v reply, set nextIndex from %v to %v", rf.me, server, old, rf.nextIndex[server])
 			rf.mu.Unlock()
 		}
 	}
@@ -529,6 +534,7 @@ func (rf *Raft) prepareAppendAppendEntriesArgs() []AppendEntriesArgs {
 func (rf *Raft) leader() {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i], rf.matchIndex[i] = len(rf.log), 0
+		// log.Printf("leader len(rf.log): %v\n", len(rf.log))
 	}
 	rf.mu.Unlock()
 	for tick, loop := time.NewTicker(HEARTBEAT_INTERVAL*time.Millisecond), true; loop; {
@@ -615,9 +621,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // helper functions
 func min(a int, b int) int {
-	if a > b {
-		return b
-	} else {
+	if a < b {
 		return a
+	} else {
+		return b
 	}
 }
